@@ -230,29 +230,47 @@ jobs:
           print("parcheado:", p)
           PATCH_PY
           cat > equiposk23.cpp <<'EQUIPOSK23_CPP'
-          // equiposk23.cpp - FASE 1: SOLO DIAGNOSTICO (no modifica nada del juego). armeabi-v7a.
-          // Espera a que el juego cargue su base de datos (CDataBase::ms_pInstance) y vuelca a la carpeta
-          // files/ de FTS15: equiposk23_log.txt y copias binarias de las tablas de equipos, plantillas y jugadores.
-          // Todas las lecturas de memoria son "seguras" (si una direccion no es legible, se anota y se sigue).
+          // equiposk23.cpp - FASE 2: agrega equipos SOLO EN MEMORIA, leyendo equiposk23.txt. armeabi-v7a.
+          // No se modifica ningun archivo del juego. Cada vez que el juego (re)carga su base de datos, se vuelven
+          // a agregar los equipos del txt. Todas las lecturas de memoria son "seguras" (no crashean si hay un error).
           #include <jni.h>
           #include <dlfcn.h>
           #include <pthread.h>
           #include <unistd.h>
           #include <stdint.h>
+          #include <stdarg.h>
+          #include <deque>
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
           #include <string>
+          #include <vector>
           #include <android/log.h>
 
           #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "EquiposK23", __VA_ARGS__)
-          static const char* DIR_ = "/sdcard/Android/data/com.firsttouchgames.fts15/files/";
+          #ifndef K23_DIR
+          #define K23_DIR "/sdcard/Android/data/com.firsttouchgames.fts15/files/"
+          #endif
+          static const char* DIR_ = K23_DIR;
+          static void* (*g_alloc)(size_t) = malloc;   // (las pruebas en PC lo sustituyen)
 
-          // Offsets dentro de CDataBase (deducidos del codigo de IsTeamIDValid / GetTeamLink / GetPlayerCount)
+          // Campos de CDataBase (deducidos del codigo de IsTeamIDValid / GetTeamLink / GetLeagueTeamIDs)
           static const uintptr_t O_TEAMS = 0x1c, O_LINKS = 0x20, O_PLAYERS = 0x38, O_NLINKS = 0x3c, O_NTEAMS = 0x40, O_NPLAYERS = 0x44;
-          static const size_t TEAM_SZ = 0x10f8, LINK_SZ = 264, PLAYER_SZ = 112, HDR = 12;
+          static const uintptr_t O_LGCOUNT = 0x90, O_LGLIST = 0x2fc;   // cuenta[liga] (4 bytes) y lista[liga] (512 bytes)
+          static const size_t TEAM_SZ = 0x10f8, LINK_SZ = 264, PLAYER_SZ = 112, HDR = 12, LG_SZ = 512;
+          static const int MAX_LG = 48;
 
           static int g_pipe[2] = {-1, -1};
+          static FILE* g_log = nullptr;
+          static uintptr_t g_myTeams = 0, g_myLinks = 0;   // arrays que fabricamos nosotros (para no repetir)
+
+          static void k23log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+          static void k23log(const char* fmt, ...) {
+            if (!g_log) { g_log = fopen((std::string(DIR_) + "equiposk23_log.txt").c_str(), "a"); if (g_log) setvbuf(g_log, nullptr, _IOLBF, 0); }
+            va_list ap; va_start(ap, fmt);
+            if (g_log) { vfprintf(g_log, fmt, ap); fputc('\n', g_log); }
+            va_end(ap);
+          }
 
           // Copia segura: si la direccion no es legible devuelve false en vez de crashear.
           static bool safe_copy(void* dst, uintptr_t src, size_t n) {
@@ -273,6 +291,7 @@ jobs:
             return true;
           }
           static bool rd32(uintptr_t a, uint32_t* v) { return safe_copy(v, a, 4); }
+          static void wr32(uintptr_t a, uint32_t v) { memcpy((void*)a, &v, 4); }
 
           static bool dump_bin(const std::string& name, uintptr_t p, size_t n) {
             FILE* f = fopen((std::string(DIR_) + name).c_str(), "wb");
@@ -287,7 +306,6 @@ jobs:
           }
 
           struct Snap { uint32_t inst, teams, links, players; int32_t nlinks, nteams, nplayers; };
-
           static bool snap(void** pp, Snap& s) {
             uint32_t v;
             if (!rd32((uintptr_t)pp, &v) || !v) return false;
@@ -296,94 +314,163 @@ jobs:
             if (!rd32(v + O_NLINKS, (uint32_t*)&s.nlinks) || !rd32(v + O_NTEAMS, (uint32_t*)&s.nteams) ||
                 !rd32(v + O_NPLAYERS, (uint32_t*)&s.nplayers)) return false;
             return s.teams && s.links && s.players && s.nteams > 0 && s.nlinks > 0 && s.nplayers > 0 &&
-                   s.nteams < 100000 && s.nlinks < 100000 && s.nplayers < 1000000;
+                   s.nteams < 5000 && s.nlinks < 5000 && s.nplayers < 1000000;
           }
 
-          static void dump_all(void** pp, const Snap& s, int n) {
-            FILE* L = fopen((std::string(DIR_) + "equiposk23_log.txt").c_str(), "a");
-            if (!L) { LOG("no se pudo abrir el log"); return; }
-            setvbuf(L, nullptr, _IOLBF, 0);
-            Dl_info di{}; dladdr((void*)pp, &di);
-            fprintf(L, "== volcado %d ==\nms_pInstance en %p (base libFTS15 %p)\n", n, (void*)pp, di.dli_fbase);
-            fprintf(L, "inst=%08x teams=%08x links=%08x players=%08x\n", s.inst, s.teams, s.links, s.players);
-            fprintf(L, "nlinks(+0x3c)=%d nteams(+0x40)=%d nplayers(+0x44)=%d\n", s.nlinks, s.nteams, s.nplayers);
-
-            fprintf(L, "-- objeto CDataBase (palabras; si parece puntero, 16 bytes que hay detras)\n");
-            for (uintptr_t o = 0; o < 0x100; o += 4) {
-              uint32_t v; if (!rd32(s.inst + o, &v)) { fprintf(L, "+0x%02x: ilegible\n", (unsigned)o); break; }
-              fprintf(L, "+0x%02x: %08x", (unsigned)o, v);
-              unsigned char b[16];
-              if (v > 0x10000 && v < 0xff000000u && safe_copy(b, v, 16)) {
-                fprintf(L, "  ->"); for (int i = 0; i < 16; i++) fprintf(L, " %02x", b[i]);
+          // ---------- equiposk23.txt ----------
+          struct Req { uint32_t id, clone; int league; };   // league: -2 = la del clon, -1 = ninguna, >=0 = esa liga
+          static std::vector<Req> read_requests() {
+            std::string path = std::string(DIR_) + "equiposk23.txt";
+            FILE* f = fopen(path.c_str(), "r");
+            if (!f) {
+              f = fopen(path.c_str(), "w");
+              if (f) {
+                fputs("# equiposk23.txt - equipos nuevos. Se agregan solo en memoria: no se toca ningun archivo del juego.\n"
+                      "# Una linea por equipo:   id_nuevo|id_clon|liga\n"
+                      "#   id_nuevo : numero de equipo libre (el nombre y el escudo salen solos si el juego los trae)\n"
+                      "#   id_clon  : equipo existente del que copia plantilla, uniforme y liga (0 = Arsenal)\n"
+                      "#   liga     : opcional. Vacio = entra en la liga del clon. -1 = no entra en ninguna liga.\n"
+                      "# Prueba: Portsmouth (id 13) con la plantilla de Arsenal. Borra la linea para quitarlo.\n"
+                      "13|0\n", f);
+                fclose(f);
               }
-              fprintf(L, "\n");
+              f = fopen(path.c_str(), "r");
+              if (!f) return {};
             }
-
-            fprintf(L, "-- equipos (id = 1a palabra de cada registro de %u bytes)\n", (unsigned)TEAM_SZ);
-            bool sorted = true; uint32_t prev = 0, mn = 0xffffffffu, mx = 0;
-            for (int i = 0; i < s.nteams; i++) {
-              uint32_t id; if (!rd32(s.teams + (uintptr_t)i * TEAM_SZ, &id)) { fprintf(L, "equipo %d ilegible\n", i); break; }
-              if (i && id <= prev) sorted = false;
-              prev = id; if (id < mn) mn = id; if (id > mx) mx = id;
-              if (i < 6 || i >= s.nteams - 4) fprintf(L, "equipo[%d] id=%u\n", i, id);
+            std::vector<Req> out; char line[256];
+            while (fgets(line, sizeof line, f)) {
+              char* p = line; while (*p == ' ' || *p == '\t') p++;
+              if (*p == '#' || *p == '\n' || *p == '\r' || !*p) continue;
+              unsigned a, b; int lg = -2;
+              int n = sscanf(p, "%u|%u|%d", &a, &b, &lg);
+              if (n >= 2 && a < 65536 && b < 65536) out.push_back({a, b, n >= 3 ? lg : -2});
+              else k23log("linea ignorada: %s", p);
             }
-            fprintf(L, "ids de equipo: min=%u max=%u ordenados=%d\n", mn, mx, sorted ? 1 : 0);
+            fclose(f); return out;
+          }
 
-            fprintf(L, "-- plantillas (id, n_jugadores; registros de %u bytes)\n", (unsigned)LINK_SZ);
-            for (int i = 0; i < s.nlinks; i++) {
-              uint32_t w[2]; if (!safe_copy(w, s.links + (uintptr_t)i * LINK_SZ, 8)) { fprintf(L, "link %d ilegible\n", i); break; }
-              if (i < 6 || i >= s.nlinks - 4) fprintf(L, "link[%d] id=%u jugadores=%u\n", i, w[0], w[1]);
+          // ---------- arrays ordenados por id (el id es el primer u32 de cada registro) ----------
+          static uint32_t id_at(const std::vector<uint8_t>& v, size_t i, size_t sz) { uint32_t x; memcpy(&x, &v[i * sz], 4); return x; }
+          static int find_id(const std::vector<uint8_t>& v, size_t n, size_t sz, uint32_t id) {
+            for (size_t i = 0; i < n; i++) if (id_at(v, i, sz) == id) return (int)i;
+            return -1;
+          }
+          static void insert_sorted(std::vector<uint8_t>& v, size_t& n, size_t sz, const uint8_t* rec) {
+            uint32_t id; memcpy(&id, rec, 4);
+            size_t pos = 0; while (pos < n && id_at(v, pos, sz) < id) pos++;
+            v.insert(v.begin() + pos * sz, rec, rec + sz); n++;
+          }
+
+          // ---------- listas de equipos por liga ----------
+          struct LgFind { int L = -1, w = 0, idx = -1; uint32_t cnt = 0; bool touched = false; std::vector<uint8_t> buf; };
+          static bool lg_load(uintptr_t inst, int L, LgFind& r) {
+            uint32_t c; if (!rd32(inst + O_LGCOUNT + 4 * L, &c) || c == 0 || c > 250) return false;
+            r.buf.assign(LG_SZ, 0);
+            if (!safe_copy(r.buf.data(), inst + O_LGLIST + (uintptr_t)L * LG_SZ, LG_SZ)) return false;
+            r.L = L; r.cnt = c; return true;
+          }
+          // Detecta si los ids son de 4 o 2 bytes (los de 4 bytes deben ser todos < 2048)
+          static int lg_width(const LgFind& r) {
+            for (int w : {4, 2}) {
+              if (r.cnt * w > LG_SZ) continue;
+              bool ok = true;
+              for (uint32_t i = 0; i < r.cnt && ok; i++) { uint32_t x = 0; memcpy(&x, &r.buf[i * w], w); if (x >= 2048) ok = false; }
+              if (ok) return w;
             }
-
-            fprintf(L, "-- jugadores (cabecera de %u bytes + registros de %u bytes; id = u16 al inicio)\n", (unsigned)HDR, (unsigned)PLAYER_SZ);
-            uint32_t h[3];
-            if (safe_copy(h, s.players, 12)) fprintf(L, "cabecera jugadores: %08x %08x %08x\n", h[0], h[1], h[2]);
-            for (int i = 0; i < s.nplayers; i++) {
-              uint16_t id; if (!safe_copy(&id, s.players + HDR + (uintptr_t)i * PLAYER_SZ, 2)) { fprintf(L, "jugador %d ilegible\n", i); break; }
-              if (i < 4 || i >= s.nplayers - 3) fprintf(L, "jugador[%d] id=%u\n", i, id);
+            return 0;
+          }
+          static uint32_t lg_get(const LgFind& r, uint32_t i) { uint32_t x = 0; memcpy(&x, &r.buf[i * r.w], r.w); return x; }
+          static void apply_reqs(const Snap& s, const std::vector<Req>& reqs) {
+            std::vector<uint8_t> T((size_t)s.nteams * TEAM_SZ), K((size_t)s.nlinks * LINK_SZ);
+            if (!safe_copy(T.data(), s.teams, T.size()) || !safe_copy(K.data(), s.links, K.size())) { k23log("no pude leer las tablas"); return; }
+            size_t nt = (size_t)s.nteams, nk = (size_t)s.nlinks; int added = 0;
+            std::deque<LgFind> lgs;   // ligas leidas (con los cambios acumulados)
+            auto lg_state = [&](int L) -> LgFind* {
+              for (auto& x : lgs) if (x.L == L) return &x;
+              LgFind r; if (!lg_load(s.inst, L, r)) return nullptr;
+              r.w = lg_width(r); if (!r.w) return nullptr;
+              lgs.push_back(r); return &lgs.back();
+            };
+            for (const Req& r : reqs) {
+              if (find_id(T, nt, TEAM_SZ, r.id) >= 0) { k23log("equipo %u: ya existe, se omite", r.id); continue; }
+              int ct = find_id(T, nt, TEAM_SZ, r.clone), ck = find_id(K, nk, LINK_SZ, r.clone);
+              if (ct < 0 || ck < 0) { k23log("equipo %u: el clon %u no existe (equipo %d, plantilla %d)", r.id, r.clone, ct, ck); continue; }
+              LgFind* lf = nullptr; int at = 0;
+              if (r.league == -2) {
+                for (int L = 0; L < MAX_LG && !lf; L++) {
+                  LgFind* p = lg_state(L); if (!p) continue;
+                  for (uint32_t i = 0; i < p->cnt; i++) if (lg_get(*p, i) == r.clone) { lf = p; at = (int)i + 1; break; }
+                }
+              } else if (r.league >= 0 && r.league < MAX_LG) { lf = lg_state(r.league); if (lf) at = (int)lf->cnt; }
+              if (lf && (lf->cnt + 1) * lf->w > LG_SZ) { k23log("equipo %u: la liga %d esta llena", r.id, lf->L); lf = nullptr; }
+              if (!lf && r.league != -1) k23log("equipo %u: no encontre liga (se crea sin liga)", r.id);
+              std::vector<uint8_t> trec(T.begin() + ct * TEAM_SZ, T.begin() + (ct + 1) * TEAM_SZ);
+              std::vector<uint8_t> krec(K.begin() + ck * LINK_SZ, K.begin() + (ck + 1) * LINK_SZ);
+              memcpy(trec.data(), &r.id, 4); memcpy(krec.data(), &r.id, 4);
+              insert_sorted(T, nt, TEAM_SZ, trec.data()); insert_sorted(K, nk, LINK_SZ, krec.data());
+              if (lf) {   // meter el id justo despues del clon
+                memmove(&lf->buf[(at + 1) * lf->w], &lf->buf[at * lf->w], (lf->cnt - at) * lf->w);
+                memcpy(&lf->buf[at * lf->w], &r.id, lf->w);
+                lf->cnt++; lf->touched = true;
+              }
+              added++;
+              k23log("equipo %u: creado como copia de %u, liga %d", r.id, r.clone, lf ? lf->L : -1);
             }
+            if (!added) return;
+            uint8_t* nT = (uint8_t*)g_alloc(T.size()); uint8_t* nK = (uint8_t*)g_alloc(K.size());
+            if (!nT || !nK) { k23log("sin memoria"); return; }
+            memcpy(nT, T.data(), T.size()); memcpy(nK, K.data(), K.size());
+            wr32(s.inst + O_TEAMS, (uint32_t)(uintptr_t)nT); wr32(s.inst + O_LINKS, (uint32_t)(uintptr_t)nK);
+            wr32(s.inst + O_NTEAMS, (uint32_t)nt); wr32(s.inst + O_NLINKS, (uint32_t)nk);
+            for (auto& o : lgs) if (o.touched) {
+              memcpy((void*)(s.inst + O_LGLIST + (uintptr_t)o.L * LG_SZ), o.buf.data(), o.cnt * o.w);
+              wr32(s.inst + O_LGCOUNT + 4 * o.L, o.cnt);
+            }
+            g_myTeams = (uintptr_t)nT; g_myLinks = (uintptr_t)nK;
+            k23log("LISTO: %d equipo(s) agregado(s). Ahora hay %zu equipos y %zu plantillas.", added, nt, nk);
+          }
 
-            char nm[96];
-            snprintf(nm, sizeof nm, "equiposk23_teams_%d.bin", n);
-            fprintf(L, "teams.bin: %s\n", dump_bin(nm, s.teams, (size_t)s.nteams * TEAM_SZ) ? "ok" : "INCOMPLETO");
-            snprintf(nm, sizeof nm, "equiposk23_links_%d.bin", n);
-            fprintf(L, "links.bin: %s\n", dump_bin(nm, s.links, (size_t)s.nlinks * LINK_SZ) ? "ok" : "INCOMPLETO");
-            snprintf(nm, sizeof nm, "equiposk23_players_%d.bin", n);
-            fprintf(L, "players.bin: %s\n", dump_bin(nm, s.players, HDR + (size_t)s.nplayers * PLAYER_SZ) ? "ok" : "INCOMPLETO");
-            snprintf(nm, sizeof nm, "equiposk23_dbobject_%d.bin", n);
-            bool okobj = dump_bin(nm, s.inst, 0x200) || dump_bin(nm, s.inst, 0x100);
-            fprintf(L, "dbobject.bin: %s\n== fin volcado %d ==\n", okobj ? "ok" : "INCOMPLETO", n);
-            fclose(L);
-            LOG("volcado %d listo (equipos=%d plantillas=%d jugadores=%d)", n, s.nteams, s.nlinks, s.nplayers);
+          static void log_first_state(void** pp, const Snap& s) {
+            Dl_info di{}; dladdr((void*)pp, &di);
+            k23log("== base de datos cargada == libFTS15 base %p | equipos=%d plantillas=%d jugadores=%d", di.dli_fbase, s.nteams, s.nlinks, s.nplayers);
+            for (int L = 0; L < MAX_LG; L++) {
+              LgFind r; if (!lg_load(s.inst, L, r)) continue;
+              r.w = lg_width(r);
+              std::string ids; for (uint32_t i = 0; i < r.cnt && i < 6 && r.w; i++) ids += std::to_string(lg_get(r, i)) + " ";
+              k23log("liga %d: %u equipos, ids de %d bytes: %s...", L, r.cnt, r.w, ids.c_str());
+            }
+            dump_bin("equiposk23_dbobject_big.bin", s.inst, 0x4000);
           }
 
           static void* worker(void*) {
             void* h = nullptr;
-            for (int i = 0; i < 1200 && !h; i++) {   // hasta 2 min esperando a libFTS15
-              h = dlopen("libFTS15.so", RTLD_NOW | RTLD_NOLOAD);
-              if (!h) usleep(100000);
-            }
+            for (int i = 0; i < 1200 && !h; i++) { h = dlopen("libFTS15.so", RTLD_NOW | RTLD_NOLOAD); if (!h) usleep(100000); }
             if (!h) { LOG("libFTS15 nunca aparecio"); return nullptr; }
             void** pp = (void**)dlsym(h, "_ZN9CDataBase12ms_pInstanceE");
             if (!pp) { LOG("no encuentro CDataBase::ms_pInstance"); return nullptr; }
-            LOG("esperando la base de datos...");
-            Snap last; memset(&last, 0, sizeof last);
-            int stable = 0, dumps = 0;
-            for (int i = 0; i < 1800 && dumps < 3; i++) {   // ~30 min, un chequeo por segundo
+            Snap last; memset(&last, 0, sizeof last); int stable = 0; bool first = true;
+            for (;;) {
               Snap s; memset(&s, 0, sizeof s);
               if (snap(pp, s)) {
                 if (memcmp(&s, &last, sizeof s) == 0) stable++; else { stable = 0; last = s; }
-                if (stable == 3) { dump_all(pp, s, dumps); dumps++; stable = 100; }  // 3 lecturas iguales = ya cargo
+                if (stable == 3 && !(s.teams == g_myTeams && s.links == g_myLinks)) {   // 3 lecturas iguales = ya termino de cargar
+                  if (first) { log_first_state(pp, s); first = false; }
+                  std::vector<Req> reqs = read_requests();
+                  k23log("-- aplicando %zu linea(s) de equiposk23.txt --", reqs.size());
+                  apply_reqs(s, reqs);
+                }
               } else { stable = 0; memset(&last, 0, sizeof last); }
               sleep(1);
             }
             return nullptr;
           }
 
+          #ifndef K23_NO_JNI
           extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
             pthread_t t; pthread_create(&t, nullptr, worker, nullptr); pthread_detach(t);
             return JNI_VERSION_1_6;
           }
+          #endif
           EQUIPOSK23_CPP
           cat > patch_smali2.py <<'PATCH2_PY'
           #!/usr/bin/env python3
