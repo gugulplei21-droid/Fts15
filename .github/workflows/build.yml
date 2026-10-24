@@ -230,7 +230,7 @@ jobs:
           print("parcheado:", p)
           PATCH_PY
           cat > equiposk23.cpp <<'EQUIPOSK23_CPP'
-          // equiposk23.cpp - FASE 3c: agrega equipos y jugadores SOLO EN MEMORIA, durante la carga del juego, leyendo equiposk23.txt. armeabi-v7a.
+          // equiposk23.cpp - FASE 3d: agrega equipos y jugadores SOLO EN MEMORIA, durante la carga del juego, leyendo equiposk23.txt. armeabi-v7a.
           // No se modifica ningun archivo del juego. Cada vez que el juego (re)carga su base de datos, se vuelven
           // a agregar los equipos del txt. Todas las lecturas de memoria son "seguras" (no crashean si hay un error).
           #include <jni.h>
@@ -276,6 +276,9 @@ jobs:
           static FILE* g_log = nullptr;
           static uintptr_t g_myTeams = 0, g_myLinks = 0;   // arrays que fabricamos nosotros (para no repetir)
           static uint32_t g_newBase = 0, g_newCount = 0;   // jugadores con ID nuevo que agregamos al cargar el juego
+          // IDs de equipo libres que SI traen escudo grande y miniatura en el juego (sin la miniatura el partido se cierra al armarse).
+          static const uint32_t SAFE_IDS[] = {27, 44, 109, 114, 117, 146, 268, 318, 331, 338, 351, 355, 365};
+          static bool g_noCrestCheck = false;               // ESCUDOS|NOCOMPROBAR: no verifica que el id tenga miniatura
           static bool g_modeLibres = true;                 // por defecto reutiliza jugadores que ningun equipo usa; MODO|NUEVOS (experimental) agrega IDs nuevos
           typedef void* (*NewArr_t)(size_t, int, int);
           static NewArr_t g_gameNew = nullptr;             // operator new[] del propio juego (para que su delete[] sea compatible)
@@ -425,22 +428,27 @@ jobs:
                       "#   Los que no escribas se crean solos con nombre generico (J13-5). Nunca se repiten jugadores.\n"
                       "#\n"
                       "# MODO (opcional):   MODO|LIBRES (por defecto: reutiliza jugadores que ningun equipo usa; es lo estable)\n"
-                      "#   MODO|NUEVOS = EXPERIMENTAL: jugadores con ID de jugador nuevo (el juego se cerro al ver la plantilla del equipo nuevo)\n"
+                      "#   MODO|NUEVOS = EXPERIMENTAL: jugadores con ID de jugador nuevo\n"
                       "#\n"
-                      "# Prueba: Portsmouth (id 13) con la estructura de Arsenal y jugadores propios.\n"
-                      "13|0\n"
-                      "J|13|Garcia\n"
-                      "J|13|Lopez\n"
-                      "J|13|Martinez\n", f);
+                      "# IDs de equipo que se pueden usar (traen escudo grande y miniatura; con otros el partido se cierra):\n"
+                      "#   27 Doncaster, 44 Auxerre, 109 Mallorca, 114 Valladolid, 117 Gijon, 146 Hibernian, 268 Kaiserslautern,\n"
+                      "#   318 De Graafschaap, 331 Novara, 338 Dijon, 351 S Rotterdam, 355 Dusseldorf, 365 Yeovil\n"
+                      "#\n"
+                      "# Prueba: Doncaster (id 27) con la estructura de Arsenal y jugadores propios. Borra las lineas para quitarlo.\n"
+                      "27|0\n"
+                      "J|27|Garcia\n"
+                      "J|27|Lopez\n"
+                      "J|27|Martinez\n", f);
                 fclose(f);
               }
               f = fopen(path.c_str(), "r");
               if (!f) return {};
             }
-            std::vector<Req> out; std::map<uint32_t, std::vector<NameRec>> pl; char line[512]; g_modeLibres = true;
+            std::vector<Req> out; std::map<uint32_t, std::vector<NameRec>> pl; char line[512]; g_modeLibres = true; g_noCrestCheck = false;
             while (fgets(line, sizeof line, f)) {
               std::string t(line); while (!t.empty() && (t.back() == '\n' || t.back() == '\r' || t.back() == ' ')) t.pop_back();
               size_t b0 = t.find_first_not_of(" \t"); if (b0 == std::string::npos || t[b0] == '#') continue; t = t.substr(b0);
+              if (t.size() > 8 && strncasecmp(t.c_str(), "ESCUDOS|", 8) == 0) { g_noCrestCheck = strncasecmp(t.c_str() + 8, "NOCOMPROBAR", 11) == 0; continue; }
               if (t.size() > 5 && strncasecmp(t.c_str(), "MODO|", 5) == 0) { g_modeLibres = strncasecmp(t.c_str() + 5, "NUEVOS", 6) != 0; continue; }
               if ((t[0] == 'J' || t[0] == 'j') && t.size() > 1 && t[1] == '|') {
                 std::vector<std::string> v = split_bar(t);
@@ -517,7 +525,7 @@ jobs:
               k23log("jugadores: reutilizando %zu libres (sin IDs nuevos)", freeList.size());
             }
             size_t fi = 0;
-            struct PEdit { uint32_t id; char16_t first[16], last[32]; uint32_t a, b, y; };
+            struct PEdit { uint32_t id; uint8_t rec[112]; };   // registro completo del jugador nuevo (copia del jugador del clon + id + nombre)
             std::vector<PEdit> edits;
             std::deque<LgFind> lgs;   // ligas leidas (con los cambios acumulados)
             auto lg_state = [&](int L) -> LgFind* {
@@ -528,6 +536,10 @@ jobs:
             };
             for (const Req& r : reqs) {
               if (find_id(T, nt, TEAM_SZ, r.id) >= 0) { k23log("equipo %u: ya existe, se omite", r.id); continue; }
+              if (!g_noCrestCheck) {
+                bool safe = false; for (uint32_t sid : SAFE_IDS) if (sid == r.id) safe = true;
+                if (!safe) { k23log("equipo %u: SE OMITE porque el juego no trae su escudo en miniatura y el partido se cerraria. IDs que si funcionan: 27 44 109 114 117 146 268 318 331 338 351 355 365", r.id); continue; }
+              }
               int ct = find_id(T, nt, TEAM_SZ, r.clone), ck = find_id(K, nk, LINK_SZ, r.clone);
               if (ct < 0 || ck < 0) { k23log("equipo %u: el clon %u no existe (equipo %d, plantilla %d)", r.id, r.clone, ct, ck); continue; }
               LgFind* lf = nullptr; int at = 0;
@@ -551,16 +563,19 @@ jobs:
                 uint32_t oldp; memcpy(&oldp, &krec[136 + 4 * k], 4);
                 uint32_t np = freeList[fi++]; used.insert(np);
                 PEdit e; memset(&e, 0, sizeof e); e.id = np;
-                if (oldp < (uint32_t)s.nplayers) { e.a = pfield(oldp, 100); e.b = pfield(oldp, 104); e.y = pfield(oldp, 108); }
+                if (oldp < (uint32_t)s.nplayers) memcpy(e.rec, &P[HDR + (size_t)oldp * PLAYER_SZ], PLAYER_SZ);   // hereda habilidades y posicion del jugador del clon
+                memcpy(e.rec, &np, 4);                                                                            // id propio
+                memset(e.rec + 36, 0, 34);   // el nombre ocupa 34 bytes (16 letras + fin); justo DESPUES (bytes 70..99) estan las habilidades: no se tocan
+                std::u16string nmv;
                 if (k < r.players.size()) {
-                  memcpy(e.first, r.players[k].first.data(), r.players[k].first.size() * 2); memcpy(e.last, r.players[k].last.data(), r.players[k].last.size() * 2);
-                } else {
-                  std::string g = "J" + std::to_string(r.id) + "-" + std::to_string(k + 1);
-                  for (size_t c = 0; c < g.size() && c < 31; c++) e.last[c] = (char16_t)g[c];
-                }
+                  const NameRec& nr = r.players[k];
+                  nmv = nr.first.empty() ? nr.last : std::u16string(1, nr.first[0]) + u". " + nr.last;
+                } else { std::string g = "J" + std::to_string(r.id) + "-" + std::to_string(k + 1); for (char c : g) nmv.push_back((char16_t)c); }
+                if (nmv.size() > 16) nmv.resize(16);
+                memcpy(e.rec + 36, nmv.data(), nmv.size() * 2);
                 memcpy(&krec[136 + 4 * k], &np, 4); edits.push_back(e);
                 uint32_t spec; memcpy(&spec, &krec[8 + 4 * k], 4);
-                std::string nm; for (int c = 0; c < 32 && e.last[c]; c++) nm += e.last[c] < 128 ? (char)e.last[c] : '?';
+                std::string nm; for (char16_t ch : nmv) nm += ch < 128 ? (char)ch : '?';
                 k23log("   casilla %u (camiseta %u, copia a %u del clon): jugador %u = %s", k + 1, spec & 255, oldp, np, nm.c_str());
               }
               if (r.players.size() > cnt) k23log("equipo %u: sobran %zu linea(s) J (la plantilla tiene %u casillas)", r.id, r.players.size() - cnt, cnt);
@@ -588,11 +603,9 @@ jobs:
               memcpy((void*)(s.inst + O_LGLIST + (uintptr_t)o.L * LG_SZ), o.buf.data(), o.cnt * o.w);
               wr32(s.inst + O_LGCOUNT + 4 * o.L, o.cnt);
             }
-            for (const PEdit& e : edits) {   // jugadores nuevos: se escriben en su registro (nombre, y habilidad/posicion copiadas)
+            for (const PEdit& e : edits) {   // jugadores nuevos: registro completo (nombre propio, habilidades del clon)
               if (e.id >= (uint32_t)s.nplayers) continue;
-              uintptr_t rec = s.players + HDR + (uintptr_t)e.id * PLAYER_SZ;
-              memcpy((void*)(rec + 4), e.first, 32); memcpy((void*)(rec + 36), e.last, 64);
-              wr32(rec + 100, e.a); wr32(rec + 104, e.b); wr32(rec + 108, e.y);
+              memcpy((void*)(s.players + HDR + (uintptr_t)e.id * PLAYER_SZ), e.rec, PLAYER_SZ);
             }
             g_myTeams = (uintptr_t)nT; g_myLinks = (uintptr_t)nK;
             k23log("LISTO: %d equipo(s) agregado(s). Ahora hay %zu equipos y %zu plantillas.", added, nt, nk);
@@ -615,8 +628,7 @@ jobs:
               uint8_t* r = nb + oldsz + (size_t)i * PLAYER_SZ; uint32_t id = n + i;
               memcpy(r, &id, 4);
               std::string nm = "Reserva " + std::to_string(i + 1);
-              for (size_t c = 0; c < nm.size() && c < 31; c++) { char16_t ch = (char16_t)nm[c]; memcpy(r + 36 + 2 * c, &ch, 2); }
-              uint32_t a = 1, b = 1, y = 1900; memcpy(r + 100, &a, 4); memcpy(r + 104, &b, 4); memcpy(r + 108, &y, 4);
+              for (size_t c = 0; c < nm.size() && c < 16; c++) { char16_t ch = (char16_t)nm[c]; memcpy(r + 36 + 2 * c, &ch, 2); }
             }
             uint32_t total = n + extra; memcpy(nb + 8, &total, 4);
             wr32(inst + O_PLAYERS, (uint32_t)(uintptr_t)nb); wr32(inst + O_NPLAYERS, total);
