@@ -230,7 +230,7 @@ jobs:
           print("parcheado:", p)
           PATCH_PY
           cat > equiposk23.cpp <<'EQUIPOSK23_CPP'
-          // equiposk23.cpp - FASE 3b: agrega equipos y jugadores SOLO EN MEMORIA, leyendo equiposk23.txt. armeabi-v7a.
+          // equiposk23.cpp - FASE 3c: agrega equipos y jugadores SOLO EN MEMORIA, durante la carga del juego, leyendo equiposk23.txt. armeabi-v7a.
           // No se modifica ningun archivo del juego. Cada vez que el juego (re)carga su base de datos, se vuelven
           // a agregar los equipos del txt. Todas las lecturas de memoria son "seguras" (no crashean si hay un error).
           #include <jni.h>
@@ -267,6 +267,7 @@ jobs:
           static const uintptr_t O_LGCOUNT = 0x90, O_LGLIST = 0x2fc;   // cuenta[liga] (4 bytes) y lista[liga] (512 bytes)
           static const size_t TEAM_SZ = 0x10f8, LINK_SZ = 264, PLAYER_SZ = 112, HDR = 12, LG_SZ = 512;
           static const int MAX_LG = 48;
+          static const uintptr_t O_MAXTID = 0x39a4;   // CDataBase+0x39a4 = "ID de equipo maximo" (lo calcula LoadTeams)
           static const uintptr_t O_MAXPID = 0x39a8;   // CDataBase+0x39a8 = "ID de jugador maximo" (lo calcula LoadPlayers)
 
           static int g_pipe[2] = {-1, -1};
@@ -323,15 +324,18 @@ jobs:
           }
 
           struct Snap { uint32_t inst, teams, links, players; int32_t nlinks, nteams, nplayers; };
-          static bool snap(void** pp, Snap& s) {
-            uint32_t v;
-            if (!rd32((uintptr_t)pp, &v) || !v) return false;
+          static bool snap_inst(uint32_t v, Snap& s) {
             s.inst = v;
             if (!rd32(v + O_TEAMS, &s.teams) || !rd32(v + O_LINKS, &s.links) || !rd32(v + O_PLAYERS, &s.players)) return false;
             if (!rd32(v + O_NLINKS, (uint32_t*)&s.nlinks) || !rd32(v + O_NTEAMS, (uint32_t*)&s.nteams) ||
                 !rd32(v + O_NPLAYERS, (uint32_t*)&s.nplayers)) return false;
             return s.teams && s.links && s.players && s.nteams > 0 && s.nlinks > 0 && s.nplayers > 0 &&
                    s.nteams < 5000 && s.nlinks < 5000 && s.nplayers < 1000000;
+          }
+          static bool snap(void** pp, Snap& s) {
+            uint32_t v;
+            if (!rd32((uintptr_t)pp, &v) || !v) return false;
+            return snap_inst(v, s);
           }
 
           // ---------- registro de cierres: si el juego se cierra, anota donde (se ve en equiposk23_log.txt) ----------
@@ -357,10 +361,23 @@ jobs:
             n += snprintf(buf + n, sizeof buf - n, "\n");
             int fd = open((std::string(DIR_) + "equiposk23_log.txt").c_str(), O_WRONLY | O_APPEND | O_CREAT, 0666);
             if (fd >= 0) { if (write(fd, buf, (size_t)n) < 0) {} close(fd); }
+            { int fd2 = open((std::string(DIR_) + "equiposk23_crash.flag").c_str(), O_WRONLY | O_CREAT, 0666); if (fd2 >= 0) close(fd2); }   // marca: el juego se cerro
             sigaction(sig, &g_old[sig], nullptr);   // devuelve el control al sistema: la instruccion vuelve a fallar y se cierra como siempre
+          }
+          // Si el juego se cerro la vez anterior, borra el partido interrumpido (CurrentMatch.dat): si no, al abrir intenta
+          // reanudarlo con equipos/jugadores que ya no estan y se cierra otra vez, sin poder abrir nunca.
+          static void cleanup_after_crash() {
+            std::string flag = std::string(DIR_) + "equiposk23_crash.flag";
+            if (access(flag.c_str(), F_OK) != 0) return;
+            unlink(flag.c_str());
+            int n = 0;
+            n += unlink((std::string(DIR_) + "CurrentMatch.dat").c_str()) == 0;
+            n += unlink((std::string(DIR_) + "currentmatch.dat").c_str()) == 0;
+            k23log("el juego se cerro la vez anterior: se borraron %d archivo(s) de partido interrumpido para que pueda abrir", n);
           }
           static void install_crash_logger() {
             static bool done = false; if (done) return; done = true;
+            cleanup_after_crash();
             int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
             for (int sg : sigs) {
               struct sigaction sa; memset(&sa, 0, sizeof sa);
@@ -482,7 +499,7 @@ jobs:
             if (!safe_copy(T.data(), s.teams, T.size()) || !safe_copy(K.data(), s.links, K.size())) { k23log("no pude leer las tablas"); return; }
             std::vector<uint8_t> P(HDR + (size_t)s.nplayers * PLAYER_SZ);
             if (!safe_copy(P.data(), s.players, P.size())) { k23log("no pude leer los jugadores"); return; }
-            size_t nt = (size_t)s.nteams, nk = (size_t)s.nlinks; int added = 0;
+            size_t nt = (size_t)s.nteams, nk = (size_t)s.nlinks; int added = 0; uint32_t maxNew = 0;
             // jugadores libres = los que no estan en ninguna plantilla (primero los de anio 1900 = registros vacios, empezando por el final)
             std::set<uint32_t> used; std::vector<uint32_t> freeList;
             for (size_t i = 0; i < nk; i++) {
@@ -525,6 +542,8 @@ jobs:
               std::vector<uint8_t> trec(T.begin() + ct * TEAM_SZ, T.begin() + (ct + 1) * TEAM_SZ);
               std::vector<uint8_t> krec(K.begin() + ck * LINK_SZ, K.begin() + (ck + 1) * LINK_SZ);
               memcpy(trec.data(), &r.id, 4); memcpy(krec.data(), &r.id, 4);
+              memset(trec.data() + 0x10ec, 0, TEAM_SZ - 0x10ec);   // igual que CTeam::CTeam(): esos 12 bytes finales empiezan en cero
+              if (r.id > maxNew) maxNew = r.id;
               // plantilla propia: cada casilla del clon se ocupa con un jugador libre distinto (misma posicion/habilidad, nombre nuevo)
               uint32_t cnt; memcpy(&cnt, &krec[4], 4); if (cnt > 32) cnt = 32;
               if (fi + cnt > freeList.size()) { k23log("equipo %u: no hay jugadores libres suficientes", r.id); continue; }
@@ -555,11 +574,16 @@ jobs:
               k23log("equipo %u: creado como copia de %u, liga %d", r.id, r.clone, lf ? lf->L : -1);
             }
             if (!added) return;
-            uint8_t* nT = (uint8_t*)g_alloc(T.size()); uint8_t* nK = (uint8_t*)g_alloc(K.size());
-            if (!nT || !nK) { k23log("sin memoria"); return; }
+            // El juego libera el array de equipos con delete[] y lee la cuenta en [ptr-4]; por eso el array lleva su "cookie" de 8 bytes
+            // delante ({tamano_elemento, cuenta}), igual que el que crea LoadTeams. El de plantillas es plano (sin cookie).
+            uint8_t* nTbase = (uint8_t*)g_alloc(T.size() + 8); uint8_t* nK = (uint8_t*)g_alloc(K.size());
+            if (!nTbase || !nK) { k23log("sin memoria"); return; }
+            uint32_t cookie[2] = {(uint32_t)TEAM_SZ, (uint32_t)nt}; memcpy(nTbase, cookie, 8);
+            uint8_t* nT = nTbase + 8;
             memcpy(nT, T.data(), T.size()); memcpy(nK, K.data(), K.size());
             wr32(s.inst + O_TEAMS, (uint32_t)(uintptr_t)nT); wr32(s.inst + O_LINKS, (uint32_t)(uintptr_t)nK);
             wr32(s.inst + O_NTEAMS, (uint32_t)nt); wr32(s.inst + O_NLINKS, (uint32_t)nk);
+            { uint32_t curMax; if (rd32(s.inst + O_MAXTID, &curMax) && maxNew > curMax) wr32(s.inst + O_MAXTID, maxNew); }
             for (auto& o : lgs) if (o.touched) {
               memcpy((void*)(s.inst + O_LGLIST + (uintptr_t)o.L * LG_SZ), o.buf.data(), o.cnt * o.w);
               wr32(s.inst + O_LGCOUNT + 4 * o.L, o.cnt);
@@ -630,12 +654,37 @@ jobs:
             orig_LoadPlayers(self);                     // el juego carga players.dat normalmente
             g_newBase = 0; g_newCount = 0;
             std::vector<Req> reqs = read_requests();
-            if (g_modeLibres || reqs.empty() || !self) { k23log("LoadPlayers: sin IDs nuevos (modo libres o txt vacio)"); return; }
+            if (g_modeLibres || reqs.empty() || !self) { g_phase = "juego"; return; }
             uint32_t extra = (uint32_t)reqs.size() * 32; if (extra > 2000) extra = 2000;
             uint32_t inst = 0;
-            if (!g_pInstPtr || !rd32((uintptr_t)g_pInstPtr, &inst) || !inst) { k23log("LoadPlayers: no encuentro la base de datos"); return; }
+            if (!g_pInstPtr || !rd32((uintptr_t)g_pInstPtr, &inst) || !inst) { k23log("LoadPlayers: no encuentro la base de datos"); g_phase = "juego"; return; }
             bool ok = append_players(inst, (uintptr_t)self, extra);
             k23log("LoadPlayers: %u jugador(es) con ID nuevo %s", extra, ok ? "agregados" : "NO se pudieron agregar (se usaran jugadores libres)");
+            g_phase = "juego";
+          }
+
+          // Aplica el txt justo al terminar CDataBase::LoadTeams(): en ese momento ya estan cargados jugadores, plantillas y equipos
+          // (y las listas por liga), y TODAVIA no han corrido ValidateLinks / CalculatePlayerStats / CPlayerDevelopment::Initialize,
+          // asi que el juego trata al equipo nuevo como uno mas del archivo (estadisticas, desarrollo de jugadores, etc.).
+          static bool g_teamsHooked = false;
+          typedef void (*LoadTeams_t)(void*);
+          static LoadTeams_t orig_LoadTeams = nullptr;
+          static void apply_at_init(uintptr_t self) {
+            uint32_t inst = 0;
+            if (!g_pInstPtr || !rd32((uintptr_t)g_pInstPtr, &inst) || !inst) { k23log("LoadTeams: no encuentro la base de datos"); return; }
+            if (self && self != inst) k23log("aviso: this=%lx distinto de ms_pInstance=%x", (unsigned long)self, inst);
+            Snap s; memset(&s, 0, sizeof s);
+            if (!snap_inst(inst, s)) { k23log("LoadTeams: tablas incompletas, no se agregan equipos"); return; }
+            std::vector<Req> reqs = read_requests();
+            if (reqs.empty()) return;
+            k23log("-- aplicando %zu linea(s) de equiposk23.txt durante la carga (modo %s) --", reqs.size(), g_modeLibres ? "LIBRES" : "NUEVOS");
+            apply_reqs(s, reqs);
+          }
+          static void hook_LoadTeams(void* self) {
+            g_phase = "LoadTeams";
+            orig_LoadTeams(self);
+            g_phase = "apply(carga)";
+            apply_at_init((uintptr_t)self);
             g_phase = "juego";
           }
 
@@ -652,6 +701,9 @@ jobs:
               void* lp = dlsym(h, "_ZN9CDataBase11LoadPlayersEv");
               if (lp && install_hook_arm(lp, (void*)hook_LoadPlayers, (void**)&orig_LoadPlayers, 0xe92d4bf0, 0xe24ddf86)) k23log("hook LoadPlayers instalado");
               else k23log("no se pudo instalar el hook de LoadPlayers (se usaran jugadores libres)");
+              void* lt = dlsym(h, "_ZN9CDataBase9LoadTeamsEv");
+              if (lt && install_hook_arm(lt, (void*)hook_LoadTeams, (void**)&orig_LoadTeams, 0xe92d4ff0, 0xe24ddf89)) { g_teamsHooked = true; k23log("hook LoadTeams instalado"); }
+              else k23log("no se pudo instalar el hook de LoadTeams (se aplicara despues de cargar)");
             }
             pthread_mutex_unlock(&g_mu);
           }
@@ -680,8 +732,9 @@ jobs:
               Snap s; memset(&s, 0, sizeof s);
               if (snap(pp, s)) {
                 if (memcmp(&s, &last, sizeof s) == 0) stable++; else { stable = 0; last = s; }
-                if (stable == 3 && !(s.teams == g_myTeams && s.links == g_myLinks)) {   // 3 lecturas iguales = ya termino de cargar
-                  if (first) { log_first_state(pp, s); first = false; }
+                if (stable == 3 && first) { log_first_state(pp, s); first = false; }
+                if (stable == 3 && !g_teamsHooked && !(s.teams == g_myTeams && s.links == g_myLinks)) {   // plan B: sin hook de LoadTeams
+                  k23log("(plan B) aplicando despues de cargar: los jugadores nuevos pueden no tener estadisticas");
                   std::vector<Req> reqs = read_requests();
                   k23log("-- aplicando %zu linea(s) de equiposk23.txt (modo %s) --", reqs.size(), g_modeLibres ? "LIBRES" : "NUEVOS");
                   g_phase = "apply";
