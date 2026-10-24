@@ -230,7 +230,7 @@ jobs:
           print("parcheado:", p)
           PATCH_PY
           cat > equiposk23.cpp <<'EQUIPOSK23_CPP'
-          // equiposk23.cpp - FASE 3: agrega equipos y jugadores (con IDs nuevos) SOLO EN MEMORIA, leyendo equiposk23.txt. armeabi-v7a.
+          // equiposk23.cpp - FASE 3b: agrega equipos y jugadores SOLO EN MEMORIA, leyendo equiposk23.txt. armeabi-v7a.
           // No se modifica ningun archivo del juego. Cada vez que el juego (re)carga su base de datos, se vuelven
           // a agregar los equipos del txt. Todas las lecturas de memoria son "seguras" (no crashean si hay un error).
           #include <jni.h>
@@ -241,6 +241,9 @@ jobs:
           #include <stdarg.h>
           #include <deque>
           #include <strings.h>
+          #include <signal.h>
+          #include <ucontext.h>
+          #include <fcntl.h>
           #include <sys/mman.h>
           #include <map>
           #include <set>
@@ -267,10 +270,12 @@ jobs:
           static const uintptr_t O_MAXPID = 0x39a8;   // CDataBase+0x39a8 = "ID de jugador maximo" (lo calcula LoadPlayers)
 
           static int g_pipe[2] = {-1, -1};
+          static const char* g_phase = "-";                // fase actual (para el registro de cierres)
+          static uintptr_t g_libBase = 0;                  // base de libFTS15 en memoria
           static FILE* g_log = nullptr;
           static uintptr_t g_myTeams = 0, g_myLinks = 0;   // arrays que fabricamos nosotros (para no repetir)
           static uint32_t g_newBase = 0, g_newCount = 0;   // jugadores con ID nuevo que agregamos al cargar el juego
-          static bool g_modeLibres = false;                // MODO|LIBRES: no agrega IDs nuevos, reutiliza jugadores sin plantilla
+          static bool g_modeLibres = true;                 // por defecto reutiliza jugadores que ningun equipo usa; MODO|NUEVOS (experimental) agrega IDs nuevos
           typedef void* (*NewArr_t)(size_t, int, int);
           static NewArr_t g_gameNew = nullptr;             // operator new[] del propio juego (para que su delete[] sea compatible)
           static void* game_alloc(size_t n) { return g_gameNew ? g_gameNew(n, 0, 0) : malloc(n); }
@@ -329,6 +334,41 @@ jobs:
                    s.nteams < 5000 && s.nlinks < 5000 && s.nplayers < 1000000;
           }
 
+          // ---------- registro de cierres: si el juego se cierra, anota donde (se ve en equiposk23_log.txt) ----------
+          static struct sigaction g_old[32];
+          static void crash_handler(int sig, siginfo_t* si, void* ctx) {
+            char buf[2400]; int n = 0; uintptr_t pc = 0, lr = 0, sp = 0;
+          #if defined(__arm__)
+            ucontext_t* uc = (ucontext_t*)ctx; pc = uc->uc_mcontext.arm_pc; lr = uc->uc_mcontext.arm_lr; sp = uc->uc_mcontext.arm_sp;
+          #else
+            (void)ctx;
+          #endif
+            auto off = [&](uintptr_t a) -> long { return (g_libBase && a >= g_libBase && a < g_libBase + 0xa00000) ? (long)(a - g_libBase) : -1; };
+            char spc[48], slr[48];
+            if (off(pc) >= 0) snprintf(spc, sizeof spc, "libFTS15+0x%lx", off(pc)); else snprintf(spc, sizeof spc, "otra libreria");
+            if (off(lr) >= 0) snprintf(slr, sizeof slr, "libFTS15+0x%lx", off(lr)); else snprintf(slr, sizeof slr, "otra libreria");
+            n += snprintf(buf + n, sizeof buf - n, "*** CIERRE senal=%d direccion=%p pc=%lx (%s) lr=%lx (%s) fase=%s modo=%s ids_nuevos=%u+%u\n   pila:",
+                          sig, si ? si->si_addr : nullptr, (unsigned long)pc, spc, (unsigned long)lr, slr, g_phase, g_modeLibres ? "LIBRES" : "NUEVOS", g_newBase, g_newCount);
+            uint32_t w; int found = 0;
+            for (int i = 0; i < 160 && found < 24 && n < (int)sizeof buf - 40; i++) {   // direcciones de libFTS15 que hay en la pila = quien llamo a quien
+              if (!sp || !rd32(sp + 4 * (uintptr_t)i, &w)) break;
+              long o = off(w); if (o >= 0) { n += snprintf(buf + n, sizeof buf - n, " +0x%lx", o); found++; }
+            }
+            n += snprintf(buf + n, sizeof buf - n, "\n");
+            int fd = open((std::string(DIR_) + "equiposk23_log.txt").c_str(), O_WRONLY | O_APPEND | O_CREAT, 0666);
+            if (fd >= 0) { if (write(fd, buf, (size_t)n) < 0) {} close(fd); }
+            sigaction(sig, &g_old[sig], nullptr);   // devuelve el control al sistema: la instruccion vuelve a fallar y se cierra como siempre
+          }
+          static void install_crash_logger() {
+            static bool done = false; if (done) return; done = true;
+            int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
+            for (int sg : sigs) {
+              struct sigaction sa; memset(&sa, 0, sizeof sa);
+              sa.sa_sigaction = crash_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK; sigemptyset(&sa.sa_mask);
+              sigaction(sg, &sa, &g_old[sg]);
+            }
+          }
+
           // ---------- equiposk23.txt ----------
           struct NameRec { std::u16string first, last; };
           struct Req { uint32_t id, clone; int league; std::vector<NameRec> players; };   // league: -2 = la del clon, -1 = ninguna
@@ -367,8 +407,8 @@ jobs:
                       "#   Van en orden, uno por cada casilla de la plantilla del clon (ver equiposk23_log.txt).\n"
                       "#   Los que no escribas se crean solos con nombre generico (J13-5). Nunca se repiten jugadores.\n"
                       "#\n"
-                      "# MODO (opcional):   MODO|NUEVOS  (por defecto: jugadores con ID nuevo)   o   MODO|LIBRES  (reutiliza jugadores que ningun\n"
-                      "#   equipo usa; mas seguro: ponlo si el juego se cierra al abrir)\n"
+                      "# MODO (opcional):   MODO|LIBRES (por defecto: reutiliza jugadores que ningun equipo usa; es lo estable)\n"
+                      "#   MODO|NUEVOS = EXPERIMENTAL: jugadores con ID de jugador nuevo (el juego se cerro al ver la plantilla del equipo nuevo)\n"
                       "#\n"
                       "# Prueba: Portsmouth (id 13) con la estructura de Arsenal y jugadores propios.\n"
                       "13|0\n"
@@ -380,11 +420,11 @@ jobs:
               f = fopen(path.c_str(), "r");
               if (!f) return {};
             }
-            std::vector<Req> out; std::map<uint32_t, std::vector<NameRec>> pl; char line[512]; g_modeLibres = false;
+            std::vector<Req> out; std::map<uint32_t, std::vector<NameRec>> pl; char line[512]; g_modeLibres = true;
             while (fgets(line, sizeof line, f)) {
               std::string t(line); while (!t.empty() && (t.back() == '\n' || t.back() == '\r' || t.back() == ' ')) t.pop_back();
               size_t b0 = t.find_first_not_of(" \t"); if (b0 == std::string::npos || t[b0] == '#') continue; t = t.substr(b0);
-              if (t.size() > 5 && strncasecmp(t.c_str(), "MODO|", 5) == 0) { g_modeLibres = strncasecmp(t.c_str() + 5, "LIBRES", 6) == 0; continue; }
+              if (t.size() > 5 && strncasecmp(t.c_str(), "MODO|", 5) == 0) { g_modeLibres = strncasecmp(t.c_str() + 5, "NUEVOS", 6) != 0; continue; }
               if ((t[0] == 'J' || t[0] == 'j') && t.size() > 1 && t[1] == '|') {
                 std::vector<std::string> v = split_bar(t);
                 if (v.size() >= 3) {
@@ -586,6 +626,7 @@ jobs:
           typedef void (*LoadPlayers_t)(void*);
           static LoadPlayers_t orig_LoadPlayers = nullptr;
           static void hook_LoadPlayers(void* self) {
+            g_phase = "LoadPlayers";
             orig_LoadPlayers(self);                     // el juego carga players.dat normalmente
             g_newBase = 0; g_newCount = 0;
             std::vector<Req> reqs = read_requests();
@@ -595,6 +636,7 @@ jobs:
             if (!g_pInstPtr || !rd32((uintptr_t)g_pInstPtr, &inst) || !inst) { k23log("LoadPlayers: no encuentro la base de datos"); return; }
             bool ok = append_players(inst, (uintptr_t)self, extra);
             k23log("LoadPlayers: %u jugador(es) con ID nuevo %s", extra, ok ? "agregados" : "NO se pudieron agregar (se usaran jugadores libres)");
+            g_phase = "juego";
           }
 
           static bool g_hooked = false;
@@ -604,6 +646,7 @@ jobs:
             if (!g_hooked) {
               g_hooked = true;
               g_pInstPtr = dlsym(h, "_ZN9CDataBase12ms_pInstanceE");
+              { Dl_info di{}; if (g_pInstPtr && dladdr(g_pInstPtr, &di)) g_libBase = (uintptr_t)di.dli_fbase; }
               g_gameNew = (NewArr_t)dlsym(h, "_Znaj13EXGSMemHeapIDi");
               if (g_gameNew) g_alloc = game_alloc;
               void* lp = dlsym(h, "_ZN9CDataBase11LoadPlayersEv");
@@ -640,8 +683,10 @@ jobs:
                 if (stable == 3 && !(s.teams == g_myTeams && s.links == g_myLinks)) {   // 3 lecturas iguales = ya termino de cargar
                   if (first) { log_first_state(pp, s); first = false; }
                   std::vector<Req> reqs = read_requests();
-                  k23log("-- aplicando %zu linea(s) de equiposk23.txt --", reqs.size());
+                  k23log("-- aplicando %zu linea(s) de equiposk23.txt (modo %s) --", reqs.size(), g_modeLibres ? "LIBRES" : "NUEVOS");
+                  g_phase = "apply";
                   apply_reqs(s, reqs);
+                  g_phase = "juego";
                 }
               } else { stable = 0; memset(&last, 0, sizeof last); }
               sleep(1);
@@ -651,6 +696,7 @@ jobs:
 
           #ifndef K23_NO_JNI
           extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM*, void*) {
+            install_crash_logger();
             void* h = dlopen("libFTS15.so", RTLD_NOW | RTLD_NOLOAD); if (h) setup_hook(h);   // si ya esta cargada, se engancha ya
             pthread_t t; pthread_create(&t, nullptr, worker, nullptr); pthread_detach(t);
             return JNI_VERSION_1_6;
